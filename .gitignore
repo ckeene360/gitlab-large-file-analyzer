@@ -1,0 +1,36 @@
+# Environment variables
+.env
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+venv/
+ENV/
+.venv
+
+# Output directories
+migration_analysis/
+example_output/
+output/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Analysis results (keep example outputs if needed)
+*.csv
+*.json
+*.txt
+!requirements.txt
+!.env.example

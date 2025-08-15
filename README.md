@@ -39,20 +39,68 @@ pip install -r requirements.txt
    - `read_repository` (required)
    - `read_user` (optional, for user-specific analysis)
 
+## Configuration
+
+The analyzer supports configuration through environment variables, which can be set in multiple ways:
+
+### Method 1: Using .env file (Recommended)
+
+1. Copy the example environment file:
+```bash
+cp .env.example .env
+```
+
+2. Edit `.env` and add your configuration:
+```bash
+# Required: Your GitLab token
+GITLAB_TOKEN=your_gitlab_token_here
+
+# Optional: GitLab instance URL (for self-hosted instances)
+# GITLAB_URL=https://gitlab.company.com
+
+# Optional: Analyze a specific group (e.g., PowerSchool Group)
+GITLAB_GROUP_URL=https://gitlab.com/powerschoolgroup
+# Or use group name directly:
+# GITLAB_GROUP_URL=powerschoolgroup
+# Or use group ID:
+# GITLAB_GROUP_ID=12345
+```
+
+### Method 2: Export environment variables
+
+```bash
+export GITLAB_TOKEN='your_gitlab_token_here'
+# Optional: Set custom GitLab URL
+export GITLAB_URL='https://gitlab.company.com'
+# Optional: Set group to analyze
+export GITLAB_GROUP_URL='https://gitlab.com/powerschoolgroup'
+```
+
 ## Usage
 
 ### Basic Usage
 
 ```bash
-# Analyze all accessible repositories for GitHub migration
+# With token from .env file or environment variable
+python gitlab_analyzer.py
+
+# Or provide token directly (overrides environment)
 python gitlab_analyzer.py --token YOUR_GITLAB_TOKEN
 ```
 
 ### Advanced Usage
 
 ```bash
-# Analyze specific group
-python gitlab_analyzer.py --token YOUR_TOKEN --group-id 12345
+# Analyze specific group by ID (e.g., PowerSchool Group)
+python gitlab_analyzer.py --group-id 93415483
+
+# Analyze specific group by name or URL
+python gitlab_analyzer.py --group-name powerschoolgroup
+
+# With environment variables set in .env
+# GITLAB_GROUP_URL=https://gitlab.com/powerschoolgroup
+# or GITLAB_GROUP_ID=93415483
+python gitlab_analyzer.py
 
 # Analyze specific user's repositories
 python gitlab_analyzer.py --token YOUR_TOKEN --user-id 67890
@@ -74,8 +122,8 @@ python gitlab_analyzer.py --token YOUR_TOKEN --output-dir ./my_results
 
 | Option | Description | Default |
 |--------|-------------|---------|
-| `--token` | GitLab personal access token (required) | - |
-| `--gitlab-url` | GitLab instance URL | https://gitlab.com |
+| `--token` | GitLab personal access token | From GITLAB_TOKEN env var |
+| `--gitlab-url` | GitLab instance URL | From GITLAB_URL env var or https://gitlab.com |
 | `--threshold` | File size threshold in MB for analysis | 50.0 (GitHub warning level) |
 | `--group-id` | Analyze specific group ID only | All accessible repos |
 | `--user-id` | Analyze specific user ID only | All accessible repos |
