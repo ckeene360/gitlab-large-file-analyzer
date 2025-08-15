@@ -15,8 +15,11 @@ import requests
 from typing import Dict, List, Optional, Tuple
 from datetime import datetime
 import csv
-from urllib.parse import urljoin
+from urllib.parse import urljoin, urlparse
 from collections import defaultdict
+from dotenv import load_dotenv
+import re
+import base64
 
 
 class GitLabAnalyzer:
@@ -183,8 +186,68 @@ class GitLabAnalyzer:
         
         return None
     
+    def get_repository_statistics(self, project_id: int) -> Dict:
+        """Get repository statistics including commit count."""
+        stats = {
+            'commit_count': 0,
+            'branch_count': 0,
+            'tag_count': 0
+        }
+        
+        # Get commit count from the default branch
+        response = self._make_request(f'/projects/{project_id}')
+        if response:
+            project_data = response.json()
+            # Get statistics if available
+            if 'statistics' in project_data:
+                stats['commit_count'] = project_data['statistics'].get('commit_count', 0)
+                stats['storage_size'] = project_data['statistics'].get('storage_size', 0)
+                stats['repository_size'] = project_data['statistics'].get('repository_size', 0)
+                stats['lfs_objects_size'] = project_data['statistics'].get('lfs_objects_size', 0)
+            
+            # Get default branch
+            default_branch = project_data.get('default_branch', 'main')
+            
+            # Try to get commit count via commits endpoint if not in statistics
+            if stats['commit_count'] == 0:
+                commits_response = self._make_request(
+                    f'/projects/{project_id}/repository/commits',
+                    params={'per_page': 1, 'page': 1}
+                )
+                if commits_response and 'x-total' in commits_response.headers:
+                    stats['commit_count'] = int(commits_response.headers.get('x-total', 0))
+        
+        return stats
+    
+    def parse_lfs_pointer(self, file_content: str, encoding: str) -> Optional[int]:
+        """Parse Git LFS pointer file to get actual file size.
+        
+        Args:
+            file_content: Base64 encoded file content
+            encoding: File encoding from GitLab API
+            
+        Returns:
+            Actual file size in bytes if it's an LFS pointer, None otherwise
+        """
+        try:
+            if encoding == 'base64':
+                # Decode base64 content
+                decoded_content = base64.b64decode(file_content).decode('utf-8')
+                
+                # Check if it's a Git LFS pointer file
+                if 'version https://git-lfs.github.com' in decoded_content:
+                    # Parse the size from LFS pointer
+                    for line in decoded_content.split('\n'):
+                        if line.strip().startswith('size '):
+                            return int(line.strip().split(' ')[1])
+        except Exception as e:
+            # If we can't parse it, it's not an LFS pointer
+            pass
+        
+        return None
+    
     def analyze_repository(self, repo: Dict) -> Dict:
-        """Analyze a single repository for large files."""
+        """Analyze a single repository for large files and collect metrics."""
         project_id = repo['id']
         repo_name = repo['name']
         repo_path = repo['path_with_namespace']
@@ -201,10 +264,21 @@ class GitLabAnalyzer:
             'lfs_candidates': [],       # Files 50-100MB that should use Git LFS
             'migration_risk': 'low',    # low, medium, high, blocker
             'total_files': 0,
-            'total_size_bytes': 0,
+            'total_commits': 0,         # NEW: Number of commits
+            'total_size_bytes': 0,      # Total size of all files analyzed
+            'repository_size_bytes': 0, # NEW: Total repository size from GitLab
+            'storage_size_bytes': 0,    # NEW: Total storage size including LFS
+            'lfs_size_bytes': 0,        # NEW: LFS objects size
             'largest_file_size': 0,
             'errors': []
         }
+        
+        # Get repository statistics
+        stats = self.get_repository_statistics(project_id)
+        repo_analysis['total_commits'] = stats.get('commit_count', 0)
+        repo_analysis['repository_size_bytes'] = stats.get('repository_size', 0)
+        repo_analysis['storage_size_bytes'] = stats.get('storage_size', 0)
+        repo_analysis['lfs_size_bytes'] = stats.get('lfs_objects_size', 0)
         
         # Get repository tree
         tree = self.get_repository_tree(project_id)
@@ -213,14 +287,65 @@ class GitLabAnalyzer:
             repo_analysis['errors'].append("Could not retrieve repository tree")
             return repo_analysis
         
-        # Filter for blob files (not directories)
+        # Count all files recursively
+        def count_files_recursive(project_id, path=""):
+            """Recursively count all files in repository."""
+            total = 0
+            tree_items = self.get_repository_tree(project_id, path)
+            if tree_items:
+                for item in tree_items:
+                    if item['type'] == 'blob':
+                        total += 1
+                    elif item['type'] == 'tree':
+                        # Recursively count files in subdirectories (limit depth to avoid API overload)
+                        if path.count('/') < 2:  # Limit recursion depth
+                            total += count_files_recursive(project_id, item['path'])
+            return total
+        
+        # Filter for blob files (not directories) at root level
         files = [item for item in tree if item['type'] == 'blob']
-        repo_analysis['total_files'] = len(files)
         
-        print(f"  Found {len(files)} files in {repo_path}")
+        # For total file count, use a more comprehensive approach
+        # Try to get all files with pagination
+        all_files = []
+        page = 1
+        per_page = 100
+        while True:
+            response = self._make_request(
+                f'/projects/{project_id}/repository/tree',
+                params={'recursive': 'true', 'per_page': per_page, 'page': page}
+            )
+            if response:
+                items = response.json()
+                file_items = [item for item in items if item['type'] == 'blob']
+                all_files.extend(file_items)
+                
+                # Check if there are more pages
+                if len(items) < per_page:
+                    break
+                page += 1
+                
+                # Limit to prevent excessive API calls
+                if page > 10:  # Max 1000 files
+                    break
+            else:
+                break
         
-        # Analyze each file
-        for file_item in files[:50]:  # Limit to first 50 files to avoid overwhelming API
+        repo_analysis['total_files'] = len(all_files)
+        
+        # Format repository size for display
+        repo_size_mb = repo_analysis['repository_size_bytes'] / (1024 * 1024)
+        storage_size_mb = repo_analysis['storage_size_bytes'] / (1024 * 1024)
+        
+        print(f"  Repository stats: {repo_analysis['total_files']} files, "
+              f"{repo_analysis['total_commits']} commits, "
+              f"{repo_size_mb:.1f} MB repo size, "
+              f"{storage_size_mb:.1f} MB total storage")
+        
+        # Analyze each file for large file detection
+        # Use all_files if available, otherwise use files from root
+        files_to_analyze = all_files if all_files else files
+        for file_item in files_to_analyze[:100]:  # Increased limit since we have better data
             file_path = file_item['path']
             
             # Get detailed file info
@@ -228,22 +353,37 @@ class GitLabAnalyzer:
             
             if file_info and 'size' in file_info:
                 file_size = file_info['size']
-                repo_analysis['total_size_bytes'] += file_size
-                repo_analysis['largest_file_size'] = max(repo_analysis['largest_file_size'], file_size)
+                encoding = file_info.get('encoding', 'unknown')
                 
-                # Categorize files based on GitHub limits
+                # Check if this is a Git LFS pointer file
+                actual_file_size = file_size
+                is_lfs_pointer = False
+                
+                if file_size < 1000 and encoding == 'base64':  # LFS pointers are small
+                    lfs_size = self.parse_lfs_pointer(file_info.get('content', ''), encoding)
+                    if lfs_size is not None:
+                        actual_file_size = lfs_size
+                        is_lfs_pointer = True
+                        print(f"    🔗 LFS POINTER DETECTED: {file_path} - Actual size: {lfs_size / (1024*1024):.2f} MB")
+                
+                repo_analysis['total_size_bytes'] += actual_file_size
+                repo_analysis['largest_file_size'] = max(repo_analysis['largest_file_size'], actual_file_size)
+                
+                # Categorize files based on GitHub limits (use actual size)
                 file_data = {
                     'repository': repo_path,
                     'repository_url': repo['web_url'],
                     'file_path': file_path,
                     'file_url': f"{repo['web_url']}/-/blob/main/{file_path}",
-                    'size_bytes': file_size,
-                    'size_mb': round(file_size / (1024 * 1024), 2),
-                    'encoding': file_info.get('encoding', 'unknown')
+                    'size_bytes': actual_file_size,
+                    'size_mb': round(actual_file_size / (1024 * 1024), 2),
+                    'encoding': encoding,
+                    'is_lfs_pointer': is_lfs_pointer,
+                    'pointer_size_bytes': file_size if is_lfs_pointer else None
                 }
                 
-                # GitHub migration analysis
-                if file_size >= self.github_limit_threshold_bytes:  # >100MB - Migration blocker
+                # GitHub migration analysis (use actual file size)
+                if actual_file_size >= self.github_limit_threshold_bytes:  # >100MB - Migration blocker
                     file_data['migration_status'] = 'BLOCKER'
                     file_data['recommendation'] = 'Must use Git LFS or split file before migration'
                     repo_analysis['github_blockers'].append(file_data)
@@ -251,7 +391,7 @@ class GitLabAnalyzer:
                     repo_analysis['migration_risk'] = 'blocker'
                     print(f"    🚫 MIGRATION BLOCKER: {file_path} ({file_data['size_mb']} MB) - Exceeds GitHub 100MB limit")
                 
-                elif file_size >= self.github_warning_threshold_bytes:  # 50-100MB - LFS candidate
+                elif actual_file_size >= self.github_warning_threshold_bytes:  # 50-100MB - LFS candidate
                     file_data['migration_status'] = 'LFS_CANDIDATE'
                     file_data['recommendation'] = 'Consider using Git LFS for better performance'
                     repo_analysis['lfs_candidates'].append(file_data)
@@ -261,8 +401,8 @@ class GitLabAnalyzer:
                     print(f"    ⚠️  LFS CANDIDATE: {file_path} ({file_data['size_mb']} MB) - Should use Git LFS")
                 
                 # Also track user-defined large files
-                if file_size >= self.file_size_threshold_bytes:
-                    if file_size < self.github_warning_threshold_bytes:
+                if actual_file_size >= self.file_size_threshold_bytes:
+                    if actual_file_size < self.github_warning_threshold_bytes:
                         file_data['migration_status'] = 'OK'
                         file_data['recommendation'] = 'File size acceptable for GitHub'
                         if repo_analysis['migration_risk'] == 'low':
@@ -309,6 +449,12 @@ class GitLabAnalyzer:
             elif repo_analysis['migration_risk'] == 'high':
                 high_risk_repos += 1
         
+        # Calculate aggregate metrics
+        total_commits = sum(repo['total_commits'] for repo in self.results['repositories'])
+        total_files = sum(repo['total_files'] for repo in self.results['repositories'])
+        total_repo_size = sum(repo['repository_size_bytes'] for repo in self.results['repositories'])
+        total_storage_size = sum(repo['storage_size_bytes'] for repo in self.results['repositories'])
+        
         # Generate summary
         end_time = datetime.now()
         duration = end_time - start_time
@@ -333,7 +479,15 @@ class GitLabAnalyzer:
             'repositories_with_large_files': total_repos_with_large_files,
             'total_large_files_found': total_large_files,
             'file_size_threshold_mb': self.file_size_threshold_bytes / (1024*1024),
-            'largest_file_found_mb': max([f['size_mb'] for f in self.results['large_files']], default=0)
+            'largest_file_found_mb': max([f['size_mb'] for f in self.results['large_files']], default=0),
+            # New aggregate metrics
+            'total_files_across_repos': total_files,
+            'total_commits_across_repos': total_commits,
+            'total_repository_size_gb': round(total_repo_size / (1024*1024*1024), 2),
+            'total_storage_size_gb': round(total_storage_size / (1024*1024*1024), 2),
+            'average_files_per_repo': round(total_files / len(repositories), 1) if repositories else 0,
+            'average_commits_per_repo': round(total_commits / len(repositories), 1) if repositories else 0,
+            'average_repo_size_mb': round(total_repo_size / (1024*1024) / len(repositories), 1) if repositories else 0
         }
         
         return self.results
@@ -349,12 +503,40 @@ class GitLabAnalyzer:
             json.dump(self.results, f, indent=2)
         print(f"Complete results saved to: {json_file}")
         
+        # Save repository summary CSV with new metrics
+        repo_summary_csv = f"{output_dir}/repository_summary_{timestamp}.csv"
+        with open(repo_summary_csv, 'w', newline='') as f:
+            fieldnames = [
+                'repository', 'url', 'total_files', 'total_commits', 
+                'repository_size_mb', 'storage_size_mb', 'lfs_size_mb',
+                'migration_risk', 'blocker_files', 'lfs_candidate_files', 'large_files'
+            ]
+            writer = csv.DictWriter(f, fieldnames=fieldnames)
+            writer.writeheader()
+            
+            for repo in self.results['repositories']:
+                writer.writerow({
+                    'repository': repo['path'],
+                    'url': repo['url'],
+                    'total_files': repo['total_files'],
+                    'total_commits': repo['total_commits'],
+                    'repository_size_mb': round(repo['repository_size_bytes'] / (1024*1024), 2),
+                    'storage_size_mb': round(repo['storage_size_bytes'] / (1024*1024), 2),
+                    'lfs_size_mb': round(repo['lfs_size_bytes'] / (1024*1024), 2),
+                    'migration_risk': repo['migration_risk'],
+                    'blocker_files': len(repo['github_blockers']),
+                    'lfs_candidate_files': len(repo['lfs_candidates']),
+                    'large_files': len(repo['large_files'])
+                })
+        print(f"Repository summary CSV saved to: {repo_summary_csv}")
+        
         # Save GitHub migration blocker files CSV
         if self.results['github_blockers']:
             blockers_csv = f"{output_dir}/github_migration_blockers_{timestamp}.csv"
             with open(blockers_csv, 'w', newline='') as f:
                 writer = csv.DictWriter(f, fieldnames=[
-                    'repository', 'file_path', 'size_mb', 'size_bytes', 'migration_status', 'recommendation', 'file_url'
+                    'repository', 'file_path', 'size_mb', 'size_bytes', 'migration_status', 'recommendation', 'file_url',
+                    'repository_url', 'encoding', 'is_lfs_pointer', 'pointer_size_bytes'
                 ])
                 writer.writeheader()
                 writer.writerows(self.results['github_blockers'])
@@ -365,7 +547,8 @@ class GitLabAnalyzer:
             lfs_csv = f"{output_dir}/git_lfs_candidates_{timestamp}.csv"
             with open(lfs_csv, 'w', newline='') as f:
                 writer = csv.DictWriter(f, fieldnames=[
-                    'repository', 'file_path', 'size_mb', 'size_bytes', 'migration_status', 'recommendation', 'file_url'
+                    'repository', 'file_path', 'size_mb', 'size_bytes', 'migration_status', 'recommendation', 'file_url',
+                    'repository_url', 'encoding', 'is_lfs_pointer', 'pointer_size_bytes'
                 ])
                 writer.writeheader()
                 writer.writerows(self.results['lfs_candidates'])
@@ -376,7 +559,8 @@ class GitLabAnalyzer:
             csv_file = f"{output_dir}/all_large_files_{timestamp}.csv"
             with open(csv_file, 'w', newline='') as f:
                 writer = csv.DictWriter(f, fieldnames=[
-                    'repository', 'file_path', 'size_mb', 'size_bytes', 'migration_status', 'recommendation', 'file_url'
+                    'repository', 'file_path', 'size_mb', 'size_bytes', 'migration_status', 'recommendation', 'file_url',
+                    'repository_url', 'encoding', 'is_lfs_pointer', 'pointer_size_bytes'
                 ])
                 writer.writeheader()
                 writer.writerows(self.results['large_files'])
@@ -462,20 +646,69 @@ class GitLabAnalyzer:
                 file_handle.write(f"• {error}\n")
 
 
+def parse_group_from_url(url_or_name):
+    """Parse group name or ID from GitLab URL or group name.
+    
+    Args:
+        url_or_name: Can be:
+            - Full URL: https://gitlab.com/powerschoolgroup
+            - Group name: powerschoolgroup
+            - Group ID: 12345
+    
+    Returns:
+        Tuple of (group_name, group_id) where one will be None
+    """
+    if not url_or_name:
+        return None, None
+    
+    # Check if it's a numeric ID
+    if str(url_or_name).isdigit():
+        return None, int(url_or_name)
+    
+    # Try to parse as URL
+    if url_or_name.startswith('http'):
+        parsed = urlparse(url_or_name)
+        path_parts = parsed.path.strip('/').split('/')
+        if path_parts and path_parts[0]:
+            return path_parts[0], None
+    
+    # Assume it's a group name
+    return url_or_name, None
+
+
 def main():
     """Main entry point for GitLab to GitHub migration analysis."""
+    # Load environment variables from .env file
+    load_dotenv()
+    
+    # Parse group from environment if provided
+    env_group_url = os.getenv('GITLAB_GROUP_URL')
+    env_group_name, env_group_id = parse_group_from_url(env_group_url)
+    
+    # Override with specific ID if provided
+    if os.getenv('GITLAB_GROUP_ID'):
+        env_group_id = int(os.getenv('GITLAB_GROUP_ID'))
+        env_group_name = None
+    
     parser = argparse.ArgumentParser(
         description='Analyze GitLab repositories for GitHub migration compatibility',
         epilog='This tool identifies files that exceed GitHub\'s limits and provides migration recommendations.'
     )
-    parser.add_argument('--gitlab-url', default='https://gitlab.com', 
-                       help='GitLab instance URL (default: https://gitlab.com)')
-    parser.add_argument('--token', required=True, 
-                       help='GitLab personal access token (required)')
-    parser.add_argument('--threshold', type=float, default=50.0,
+    parser.add_argument('--gitlab-url', 
+                       default=os.getenv('GITLAB_URL', 'https://gitlab.com'), 
+                       help='GitLab instance URL (default: https://gitlab.com or GITLAB_URL env var)')
+    parser.add_argument('--token', 
+                       default=os.getenv('GITLAB_TOKEN'),
+                       help='GitLab personal access token (can be set via GITLAB_TOKEN env var)')
+    parser.add_argument('--threshold', type=float, 
+                       default=float(os.getenv('THRESHOLD_MB', '50.0')),
                        help='File size threshold in MB for analysis (default: 50.0 - GitHub warning threshold)')
     parser.add_argument('--group-id', type=int,
-                       help='Analyze specific group ID only')
+                       default=env_group_id,
+                       help='Analyze specific group ID only (can be set via GITLAB_GROUP_URL or GITLAB_GROUP_ID env var)')
+    parser.add_argument('--group-name', type=str,
+                       default=env_group_name,
+                       help='Analyze specific group by name (can be set via GITLAB_GROUP_URL env var)')
     parser.add_argument('--user-id', type=int,
                        help='Analyze specific user ID only')
     parser.add_argument('--max-repos', type=int,
@@ -485,6 +718,15 @@ def main():
     
     args = parser.parse_args()
     
+    # Check if token is provided
+    if not args.token:
+        print("ERROR: GitLab token is required. Provide via --token argument or GITLAB_TOKEN environment variable.")
+        print("\nYou can set it in a .env file:")
+        print("  GITLAB_TOKEN=your_token_here")
+        print("\nOr export it as an environment variable:")
+        print("  export GITLAB_TOKEN=your_token_here")
+        sys.exit(1)
+    
     # Initialize analyzer
     analyzer = GitLabAnalyzer(
         gitlab_url=args.gitlab_url,
@@ -492,10 +734,23 @@ def main():
         file_size_threshold_mb=args.threshold
     )
     
+    # If group name is provided, we need to fetch the group ID
+    group_id_to_use = args.group_id
+    if args.group_name and not args.group_id:
+        print(f"Looking up group '{args.group_name}'...")
+        # Make API call to get group ID from name
+        response = analyzer._make_request(f'/groups/{args.group_name}')
+        if response:
+            group_data = response.json()
+            group_id_to_use = group_data.get('id')
+            print(f"Found group '{args.group_name}' with ID: {group_id_to_use}")
+        else:
+            print(f"WARNING: Could not find group '{args.group_name}', analyzing all accessible repositories")
+    
     try:
         # Run analysis
         results = analyzer.run_analysis(
-            group_id=args.group_id,
+            group_id=group_id_to_use,
             user_id=args.user_id,
             max_repos=args.max_repos
         )
@@ -509,6 +764,10 @@ def main():
         print(f"Large files found: {summary['total_large_files_found']}")
         print(f"Repositories with large files: {summary['repositories_with_large_files']}")
         print(f"Largest file: {summary['largest_file_found_mb']:.1f} MB")
+        print(f"\nAggregate Metrics:")
+        print(f"Total files: {summary['total_files_across_repos']:,}")
+        print(f"Total commits: {summary['total_commits_across_repos']:,}")
+        print(f"Total repository size: {summary['total_repository_size_gb']:.2f} GB")
         
         # Save results
         analyzer.save_results(args.output_dir)

@@ -7,16 +7,22 @@ instead of through the command line interface.
 """
 
 import os
+from dotenv import load_dotenv
 from gitlab_analyzer import GitLabAnalyzer
 
 def main():
+    # Load environment variables from .env file
+    load_dotenv()
+    
     # Configuration
-    GITLAB_URL = "https://gitlab.com"  # Change to your GitLab instance
-    ACCESS_TOKEN = os.environ.get('GITLAB_TOKEN')  # Get from environment variable
+    GITLAB_URL = os.getenv('GITLAB_URL', 'https://gitlab.com')  # From env or default
+    ACCESS_TOKEN = os.getenv('GITLAB_TOKEN')  # Get from environment variable
     
     if not ACCESS_TOKEN:
-        print("Please set GITLAB_TOKEN environment variable")
-        print("Example: export GITLAB_TOKEN='your_token_here'")
+        print("ERROR: GitLab token is required.")
+        print("\nPlease set GITLAB_TOKEN in one of these ways:")
+        print("1. Create a .env file with: GITLAB_TOKEN=your_token_here")
+        print("2. Export environment variable: export GITLAB_TOKEN='your_token_here'")
         return
     
     # Initialize analyzer
